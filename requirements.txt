@@ -1,0 +1,5 @@
+python==3.11
+rllm
+# pyg
+llama-index
+llama-index-llms-openai-like
