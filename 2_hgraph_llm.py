@@ -31,7 +31,7 @@ class TACM12K_STAPE(BaseSTAPE):
             self.paper_text,
             self.y,
             self.masks
-        ) = TACM12K.load_all()
+        ) = TACM12K.load_rag_data()
 
     def pyg_graph(self):
         # Convert HeteroGraphData to PyG Data
