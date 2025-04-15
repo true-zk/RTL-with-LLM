@@ -1,0 +1,13 @@
+# base
+python==3.11
+rllm # copy the https://github.com/rllm-team/rllm.git/rllm in root dir
+pandas
+
+# torch
+pytorch
+torch_geometric
+
+# llm
+llama-index
+llama-index-llms-openai-like
+llama_index-embeddings-huggingface
