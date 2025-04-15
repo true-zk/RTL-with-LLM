@@ -3,3 +3,6 @@ rllm
 # pyg
 llama-index
 llama-index-llms-openai-like
+pandas
+
+rllm # copy the https://github.com/rllm-team/rllm.git/rllm in root dir
