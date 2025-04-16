@@ -1,7 +1,10 @@
 # base
 python==3.11
-rllm # copy the https://github.com/rllm-team/rllm.git/rllm in root dir
 pandas
+
+# rllm and rllm dependencies
+rllm # copy the https://github.com/rllm-team/rllm.git/rllm in root dir
+scikit-learn
 
 # torch
 pytorch
