@@ -2,8 +2,10 @@ import os
 import os.path as osp
 import shutil
 from typing import Optional, Union, Dict, Tuple, List, Generator
+import json
 
 import torch
+from torch import Tensor
 import pandas as pd
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import NeighborLoader
@@ -13,7 +15,7 @@ from rllm.data import HeteroGraphData
 from config import RAW_DATA_ROOT_DIR, TAG_ROOT_DIR, PROMPT_1_DIR, PROMPT_2_DIR
 from llm import llm
 from bge_model import embed_model, tokenizer
-from utils import print_warning, print_success
+from utils import print_warning, print_success, print_danger
 
 
 class BaseLoadCls:
@@ -35,10 +37,13 @@ class BaseLoadCls:
     def __init__(self, rag_root_dir: str = TAG_ROOT_DIR) -> None:
         self.rag_dir = osp.join(rag_root_dir, self.dataset_name)
         self.prompt_set1_dir = osp.join(PROMPT_1_DIR, self.dataset_name)
+        self.prompt_set2_dir = osp.join(PROMPT_2_DIR, self.dataset_name)
         if not osp.exists(self.rag_dir):
             os.makedirs(self.rag_dir, exist_ok=True)
         if not osp.exists(self.prompt_set1_dir):
             os.makedirs(self.prompt_set1_dir, exist_ok=True)
+        if not osp.exists(self.prompt_set2_dir):
+            os.makedirs(self.prompt_set2_dir, exist_ok=True)
 
         self.raw_dir = osp.join(RAW_DATA_ROOT_DIR, self.dataset_name)
         self.rag_dir = osp.join(TAG_ROOT_DIR, self.dataset_name)
@@ -95,6 +100,25 @@ class BaseLoadCls:
         pyg_graph = data['pyg_graph']
         return pyg_graph
 
+    def text_attr_fetch(self, texts: List[str], idx: Tensor) -> Generator:
+        r"""Fetch text attrbutes from list."""
+        idx = idx.tolist()
+        for i in idx:
+            yield texts[i]
+
+    def gen_edge_prompt(self, edge_type: List[str], batch: HeteroData) -> str:
+        edges: Tensor = batch[edge_type[0], edge_type[1], edge_type[2]].edge_index
+        if edges.numel() == 0:
+            return ""
+        edge_prompt = ""
+        for i in range(edges.shape[1]):
+            edge_prompt += (
+                f"『{edge_type[0]} node {edges[0][i]}』 "
+                f"-- {edge_type[1]} --> "
+                f"『{edge_type[2]} node {edges[1][i]}』\n"
+            )
+        return edge_prompt
+
     # abstract methods ########################################
     def build_tag(self) -> None:
         raise NotImplementedError("Please implement the build_tag method.")
@@ -106,6 +130,10 @@ class BaseLoadCls:
     def prompt_set1_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
         r"""Return a generator for TAPE prompt."""
         raise NotImplementedError("Please implement the prompt_set1_loader method.")
+
+    def prompt_set2_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
+        r"""Return a generator for sampled TAPE prompt."""
+        raise NotImplementedError("Please implement the prompt_set2_loader method.")
 
 
 class TACM12K(BaseLoadCls):
@@ -192,7 +220,10 @@ class TACM12K(BaseLoadCls):
             dtype=torch.long,
         ).T
         hgraph['paper', 'cites', 'paper'].edge_index = edge_list
-        pyg_graph['paper', 'cites', 'paper'].edge_index = edge_list
+        # pyg_graph['paper', 'cites', 'paper'].edge_index = edge_list
+
+        rev_edge_list = edge_list.flip(0)
+        pyg_graph['paper', 'cited_by', 'paper'].edge_index = rev_edge_list  # for pyg loader
 
         # load writing table
         writing_df = self.load_raw_df("writings.csv")
@@ -200,8 +231,12 @@ class TACM12K(BaseLoadCls):
             writing_df[["paper_id", "author_id"]].values,
             dtype=torch.long,
         ).T
+
         hgraph['paper', 'written_by', 'author'].edge_index = edge_list
-        pyg_graph['paper', 'written_by', 'author'].edge_index = edge_list
+        # pyg_graph['paper', 'written_by', 'author'].edge_index = edge_list
+
+        rev_edge_list = edge_list.flip(0)
+        pyg_graph['author', 'writes', 'paper'].edge_index = rev_edge_list  # for pyg loader
 
         # Nodes
         pyg_graph['paper'].num_nodes = hgraph['paper'].num_nodes = len(paper_df)
@@ -220,9 +255,14 @@ class TACM12K(BaseLoadCls):
         # Create a NeighborLoader for the PyG graph
         pyg_graph = self.get_pyg_graph()
         # target_node_id = torch.arange(len(y), dtype=torch.long)
+        """
+        pyg sampling for dst nodes:
+        paper (neighbor) -> cited_by -> paper (seed)
+        author (neighbor) -> writes -> paper (seed)
+        """
         num_neighbors = {
-            ('paper', 'cites', 'paper'): [10, 5],
-            ('paper', 'written_by', 'author'): [10, 5],
+            ('paper', 'cited_by', 'paper'): [5],
+            ('author', 'writes', 'paper'): [5],
         }
         loader = NeighborLoader(
             pyg_graph,
@@ -278,6 +318,56 @@ class TACM12K(BaseLoadCls):
                 with open(prompt_file, "w") as f:
                     f.write(prompt)
             yield prompt
+
+    def prompt_set2_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
+        r"""Return a generator for sampled TAPE prompt.
+        If `persist`, save the prompts to 'prompt_set2_dir/{dataset_name}/{batch_size}.json'.
+        """
+        if persist:
+            persist_dir = self.prompt_set2_dir
+            if not osp.exists(persist_dir):
+                os.makedirs(persist_dir, exist_ok=True)
+
+        prompt_head = (
+            "You are dealing with a small knowledge graph of nodes and edges."
+            "Each node in the graph contains a text description, and "
+            "the edge represents the relationship between nodes and the direction of information transmission."
+            "The graph is: \n"
+        )
+
+        pyg_neighbor_loader = self.pyg_loader(batch_size)
+        paper_text = self.load_rag_data()['paper_text']
+        author_text = self.load_rag_data()['author_text']
+
+        res = []
+        for batch in pyg_neighbor_loader:
+            num_nodes = f"Number of paper nodes: {batch['paper'].num_nodes}.\n"
+            num_nodes += f"Number of author nodes: {batch['author'].num_nodes}.\n"
+
+            nodes = "\n Paper nodes:\n"
+            for j, el in enumerate(self.text_attr_fetch(paper_text, batch['paper'].n_id)):
+                nodes += f"『Paper node {j}』, description: {el}\n"
+
+            nodes += "\n Author nodes:\n"
+            for j, el in enumerate(self.text_attr_fetch(author_text, batch['author'].n_id)):
+                nodes += f"『Author node {j}』, description: {el}\n"
+
+            edges = "\n Edges:\n"
+            edges += self.gen_edge_prompt(
+                ['paper', 'cited_by', 'paper'], batch
+            )
+            edges += self.gen_edge_prompt(
+                ['author', 'writes', 'paper'], batch
+            )
+
+            prompt = prompt_head + num_nodes + nodes + edges
+            yield prompt
+            res.append(prompt)
+
+        if persist:
+            prompt_file = osp.join(persist_dir, f"{batch_size}.json")
+            with open(prompt_file, "w") as f:
+                json.dump(res, f)
 
 
 class TLF2K(BaseLoadCls):
@@ -379,9 +469,8 @@ class TLF2K(BaseLoadCls):
             user_friends_df[["userID", "friendID"]].values,
             dtype=torch.long,
         ).T
-        # Keep this process when using
-        # rev_edge_list = edge_list.flip(0)
-        # edge_list = torch.cat([edge_list, rev_edge_list], dim=1)
+        rev_edge_list = edge_list.flip(0)
+        edge_list = torch.cat([edge_list, rev_edge_list], dim=1)
         hgraph['user', 'friends_with', 'user'].edge_index = edge_list
         pyg_graph['user', 'friends_with', 'user'].edge_index = edge_list
 
@@ -422,8 +511,8 @@ class TLF2K(BaseLoadCls):
         pyg_graph = self.get_pyg_graph()
         # target_node_id = torch.arange(len(y), dtype=torch.long)
         num_neighbors = {
-            ('user', 'friends_with', 'user'): [10, 5],
-            ('user', 'likes', 'artist'): [10, 5],
+            ('user', 'friends_with', 'user'): [5],
+            ('user', 'likes', 'artist'): [5],
         }
         loader = NeighborLoader(
             pyg_graph,
@@ -480,6 +569,59 @@ class TLF2K(BaseLoadCls):
                     f.write(prompt)
             yield prompt
 
+    def prompt_set2_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
+        # TODO 只采样一阶邻居不够，需要采样friends然后再采样一阶artist
+        r"""Return a generator for sampled TAPE prompt.
+        If `persist`, save the prompts to 'prompt_set2_dir/{dataset_name}/{batch_size}.json'.
+        """
+        if persist:
+            persist_dir = self.prompt_set2_dir
+            if not osp.exists(persist_dir):
+                os.makedirs(persist_dir, exist_ok=True)
+
+        prompt_head = (
+            "You are dealing with a small knowledge graph of nodes and edges."
+            "Each node in the graph contains a text description, and "
+            "the edge represents the relationship between nodes and the direction of information transmission."
+            "The graph is: \n"
+        )
+
+        prompt_tail = (
+            ""
+        )
+
+        pyg_neighbor_loader = self.pyg_loader(batch_size)
+        artist_text = self.load_rag_data()['artist_text']
+
+        res = []
+        for batch in pyg_neighbor_loader:
+            num_nodes = f"Number of artist nodes: {batch['artist'].num_nodes}.\n"
+            num_nodes += f"Number of user nodes: {batch['user'].num_nodes}.\n"
+
+            nodes = "\n Paper nodes:\n"
+            for j, el in enumerate(self.text_attr_fetch(paper_text, batch['paper'].n_id)):
+                nodes += f"『Paper node {j}』, description: {el}\n"
+
+            nodes += "\n Author nodes:\n"
+            for j, el in enumerate(self.text_attr_fetch(author_text, batch['author'].n_id)):
+                nodes += f"『Author node {j}』, description: {el}\n"
+
+            edges = "\n Edges:\n"
+            edges += self.gen_edge_prompt(
+                ['paper', 'cited_by', 'paper'], batch
+            )
+            edges += self.gen_edge_prompt(
+                ['author', 'writes', 'paper'], batch
+            )
+
+            prompt = prompt_head + num_nodes + nodes + edges
+            yield prompt
+            res.append(prompt)
+
+        if persist:
+            prompt_file = osp.join(persist_dir, f"{batch_size}.json")
+            with open(prompt_file, "w") as f:
+                json.dump(res, f)
 
 class TML1M(BaseLoadCls):
     raw_data_list = [
@@ -668,29 +810,40 @@ class TML1M(BaseLoadCls):
 
 
 # Script functions ############################################
-def build_all():
-    r"""Build all datasets."""
-    print_warning(
-        "This will take a long time, "
-        "please run it in the background. "
-        "You can also run it separately in the terminal."
-    )
-    for i in [TACM12K, TLF2K, TML1M]:
-        tmp_ins: BaseLoadCls = i()
-        print(f"Build {i.__name__} dataset done.")
-        print("Building tag data ...")
-        tmp_ins.build_tag()
-        print("Building prompt 1 (TAPE prompt) ...")
-        for _ in tmp_ins.prompt_set1_loader(batch_size=1):
-            continue
-        for _ in tmp_ins.prompt_set1_loader(batch_size=5):
-            continue
-        for _ in tmp_ins.prompt_set1_loader(batch_size=10):
-            continue
 
+datasets = [TACM12K, TLF2K, TML1M]
+
+def apply_all(fn: str, *args, **kwargs):
+    r"""Apply a function to all datasets."""
+    for cls in datasets:
+        ins = cls()
+        if hasattr(ins, fn):
+            method = getattr(ins, fn)
+            if callable(method):
+                print(f"Applying {fn} to {cls.__name__} ...")
+                method(*args, **kwargs)
+            else:
+                print_danger(f"{fn} is not a callable method.")
+                raise ValueError(f"{fn} is not a callable method.")
     print_success(
-        "Done."
+        f"Applied {fn} to all datasets."
     )
 
+def build_tag():
+    apply_all("build_tag")
 
-# build_all()
+def build_prompt1():
+    r"""Build all datasets."""
+    for i in [1, 5, 10]:
+        apply_all("prompt_set1_loader", i, True)
+
+
+a = TACM12K()
+# a.build_tag()
+for i in a.prompt_set2_loader():
+    continue
+
+with open("prompt_2/tacm12k/1.json", "r") as f:
+    data = json.load(f)
+print(len(data))
+print(data[0])
