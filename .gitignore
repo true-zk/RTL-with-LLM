@@ -1,5 +1,7 @@
 /rllm
-/data
 /**/__pycache__/
 draft.py
 /bge-large-en-v1.5
+/tag_data
+/prompt_*
+/data

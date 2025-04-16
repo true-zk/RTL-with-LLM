@@ -1,7 +1,7 @@
 import os
 import os.path as osp
 import shutil
-from typing import Optional, Union, Dict, Tuple, List
+from typing import Optional, Union, Dict, Tuple, List, Generator
 
 import torch
 import pandas as pd
@@ -10,9 +10,10 @@ from torch_geometric.loader import NeighborLoader
 
 from rllm.data import HeteroGraphData
 
-from config import RAW_DATA_ROOT_DIR, RAG_ROOT_DIR
+from config import RAW_DATA_ROOT_DIR, TAG_ROOT_DIR, PROMPT_1_DIR, PROMPT_2_DIR
 from llm import llm
-# from bge_model import embed_model, tokenizer
+from bge_model import embed_model, tokenizer
+from utils import print_warning, print_success
 
 
 class BaseLoadCls:
@@ -25,39 +26,47 @@ class BaseLoadCls:
 
     # path properties
     dataset_name: str = ""
-    raw_dir: str = ""
-    rag_dir: str = ""
 
     # model properties
     llm = llm
-    # embed_model = embed_model
-    # tokenizer = tokenizer
+    embed_model = embed_model
+    tokenizer = tokenizer
 
-    @classmethod
-    def load_raw_df(cls, file: Optional[str]) -> Union[pd.DataFrame, dict]:
+    def __init__(self, rag_root_dir: str = TAG_ROOT_DIR) -> None:
+        self.rag_dir = osp.join(rag_root_dir, self.dataset_name)
+        self.prompt_set1_dir = osp.join(PROMPT_1_DIR, self.dataset_name)
+        if not osp.exists(self.rag_dir):
+            os.makedirs(self.rag_dir, exist_ok=True)
+        if not osp.exists(self.prompt_set1_dir):
+            os.makedirs(self.prompt_set1_dir, exist_ok=True)
+
+        self.raw_dir = osp.join(RAW_DATA_ROOT_DIR, self.dataset_name)
+        self.rag_dir = osp.join(TAG_ROOT_DIR, self.dataset_name)
+        self.prompt_set1_dir = osp.join(PROMPT_1_DIR, self.dataset_name)
+
+    def load_raw_df(self, file: Optional[str]) -> Union[pd.DataFrame, dict]:
         r"""Return the file; if file is None, return all files in raw data list."""
         if file is not None:
-            assert file in cls.raw_data_list
-            file = osp.join(cls.raw_dir, file)
+            assert file in self.raw_data_list
+            file = osp.join(self.raw_dir, file)
             return pd.read_csv(file)
 
         data = {}
-        for file in cls.raw_data_list:
-            file_path = osp.join(cls.raw_dir, file)
+        for file in self.raw_data_list:
+            file_path = osp.join(self.raw_dir, file)
             if not osp.exists(file_path):
-                raise FileNotFoundError(f"File {file} not found in {cls.raw_dir}")
+                raise FileNotFoundError(f"File {file} not found in {self.raw_dir}")
             data[file] = pd.read_csv(file_path)
         return data
 
-    @classmethod
-    def load_rag_data(cls) -> Dict[str, Union[HeteroGraphData, str, torch.Tensor]]:
+    def load_rag_data(self) -> Dict[str, Union[HeteroGraphData, str, torch.Tensor]]:
         r"""Load all data from rag data list."""
         data = {}
-        for file in cls.rag_data_list:
+        for file in self.rag_data_list:
             file: str
-            file_path = osp.join(cls.rag_dir, file)
+            file_path = osp.join(self.rag_dir, file)
             if not osp.exists(file_path):
-                raise FileNotFoundError(f"File {file} not found in {cls.rag_dir}")
+                raise FileNotFoundError(f"File {file} not found in {self.rag_dir}")
             if file.endswith(".pkl"):
                 data['hgraph'] = HeteroGraphData.load(file_path)
             elif file.endswith(".txt"):
@@ -67,10 +76,9 @@ class BaseLoadCls:
                 data[file.replace(".pt", "")] = torch.load(file_path, weights_only=False)
         return data
 
-    @classmethod
-    def get_dataset(cls) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    def get_dataset(self) -> Tuple[List[torch.Tensor], torch.Tensor]:
         r"""Get dataset from rag data list."""
-        data = cls.load_rag_data()
+        data = self.load_rag_data()
         masks = data['masks']
         y = data['y']
         train_mask = masks['train_mask']
@@ -81,16 +89,23 @@ class BaseLoadCls:
         test_ids = torch.nonzero(test_mask).view(-1)
         return [train_ids, val_ids, test_ids], y
 
-    @classmethod
-    def get_pyg_graph(cls) -> HeteroData:
+    def get_pyg_graph(self) -> HeteroData:
         r"""Get pyg graph from rag data list."""
-        data = cls.load_rag_data()
+        data = self.load_rag_data()
         pyg_graph = data['pyg_graph']
         return pyg_graph
 
     # abstract methods ########################################
     def build_tag(self) -> None:
         raise NotImplementedError("Please implement the build_tag method.")
+
+    def pyg_loader(self, batch_size: int = 1) -> NeighborLoader:
+        r"""Return a NeighborLoader for the pyg graph."""
+        raise NotImplementedError("Please implement the pyg_loader method.")
+
+    def prompt_set1_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
+        r"""Return a generator for TAPE prompt."""
+        raise NotImplementedError("Please implement the prompt_set1_loader method.")
 
 
 class TACM12K(BaseLoadCls):
@@ -117,19 +132,11 @@ class TACM12K(BaseLoadCls):
     cnt_labels = len(labels)  # 14
 
     dataset_name = "tacm12k"
-    raw_dir = osp.join(RAW_DATA_ROOT_DIR, dataset_name)
-    rag_dir = osp.join(RAG_ROOT_DIR, dataset_name)
 
-    def __init__(self, rag_root_dir: str = RAG_ROOT_DIR) -> None:
-        self.rag_dir = osp.join(rag_root_dir, self.dataset_name)
-        if not osp.exists(self.rag_dir):
-            os.makedirs(self.rag_dir, exist_ok=True)
-
-    @classmethod
-    def build_tag(cls):
+    def build_tag(self):
         # load author table
-        author_df = cls.load_raw_df("authors.csv")
-        text_attr = author_df.apply(
+        author_df = self.load_raw_df("authors.csv")
+        author_text_attr = author_df.apply(
             lambda row: (
                 f"author_id is: {row['author_id']}, "
                 f"name is: {row['name']}, "
@@ -137,15 +144,15 @@ class TACM12K(BaseLoadCls):
             ),
             axis=1,
         )
-        author_text_file = osp.join(cls.rag_dir, "author_text.txt")
+        author_text_file = osp.join(self.rag_dir, "author_text.txt")
         with open(author_text_file, "w") as f:
-            for text in text_attr:
+            for text in author_text_attr:
                 f.write(text + "\n")
 
         # load paper table
         # paper table is target table
-        paper_df = cls.load_raw_df("papers.csv")
-        text_attr = paper_df.apply(
+        paper_df = self.load_raw_df("papers.csv")
+        paper_text_attr = paper_df.apply(
             lambda row: (
                 f"paper_id is: {row['paper_id']}, "
                 f"year is: {row['year']}, "
@@ -155,31 +162,31 @@ class TACM12K(BaseLoadCls):
             ),
             axis=1,
         )
-        paper_text_file = osp.join(cls.rag_dir, "paper_text.txt")
+        paper_text_file = osp.join(self.rag_dir, "paper_text.txt")
         with open(paper_text_file, "w") as f:
-            for text in text_attr:
+            for text in paper_text_attr:
                 f.write(text + "\n")
 
         # y
         y = paper_df["conference"].values
-        y = [cls.labels.index(i) for i in y]
+        y = [self.labels.index(i) for i in y]
         y = torch.tensor(y, dtype=torch.long)
         torch.save(
             y,
-            osp.join(cls.rag_dir, "y.pt"),
+            osp.join(self.rag_dir, "y.pt"),
         )
 
         # masks
         shutil.copy2(
-            osp.join(cls.raw_dir, "masks.pt"),
-            osp.join(cls.rag_dir, "masks.pt"),
+            osp.join(self.raw_dir, "masks.pt"),
+            osp.join(self.rag_dir, "masks.pt"),
         )
 
         hgraph = HeteroGraphData()
         pyg_graph = HeteroData()
         # Edges
         # load citation table
-        citation_df = cls.load_raw_df("citations.csv")
+        citation_df = self.load_raw_df("citations.csv")
         edge_list = torch.tensor(
             citation_df[["paper_id", "paper_id_cited"]].values,
             dtype=torch.long,
@@ -188,7 +195,7 @@ class TACM12K(BaseLoadCls):
         pyg_graph['paper', 'cites', 'paper'].edge_index = edge_list
 
         # load writing table
-        writing_df = cls.load_raw_df("writings.csv")
+        writing_df = self.load_raw_df("writings.csv")
         edge_list = torch.tensor(
             writing_df[["paper_id", "author_id"]].values,
             dtype=torch.long,
@@ -199,19 +206,20 @@ class TACM12K(BaseLoadCls):
         # Nodes
         pyg_graph['paper'].num_nodes = hgraph['paper'].num_nodes = len(paper_df)
         pyg_graph['author'].num_nodes = hgraph['author'].num_nodes = len(author_df)
+        # pyg_graph['paper'].text = paper_text_attr.tolist()
+        pyg_graph['paper'].y = y
+        # pyg_graph['author'].text = author_text_attr.tolist()
 
         print("rllm hgraph:", hgraph)
         print("pyg hgraph:", pyg_graph)
-        hgraph.save(osp.join(cls.rag_dir, "tacm12k_graph.pkl"))
-        torch.save(pyg_graph, osp.join(cls.rag_dir, "pyg_graph.pt"))
+        hgraph.save(osp.join(self.rag_dir, "tacm12k_graph.pkl"))
+        torch.save(pyg_graph, osp.join(self.rag_dir, "pyg_graph.pt"))
 
-    # sampled tape utility functions ##########################
-    @classmethod
-    def pyg_loader(cls, batch_size: int = 1) -> NeighborLoader:
+    # tape utility functions ##########################
+    def pyg_loader(self, batch_size: int = 1) -> NeighborLoader:
         # Create a NeighborLoader for the PyG graph
-        pyg_graph = cls.get_pyg_graph()
-        _, y = cls.get_dataset()
-        target_node_id = torch.arange(len(y), dtype=torch.long)
+        pyg_graph = self.get_pyg_graph()
+        # target_node_id = torch.arange(len(y), dtype=torch.long)
         num_neighbors = {
             ('paper', 'cites', 'paper'): [10, 5],
             ('paper', 'written_by', 'author'): [10, 5],
@@ -221,9 +229,55 @@ class TACM12K(BaseLoadCls):
             num_neighbors=num_neighbors,
             batch_size=batch_size,
             shuffle=False,
-            input_nodes=target_node_id,
+            input_nodes="paper",
         )
         return loader
+
+    def prompt_set1_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
+        if persist:
+            persist_dir = osp.join(self.prompt_set1_dir, f"{batch_size}")
+            if not osp.exists(persist_dir):
+                os.makedirs(persist_dir, exist_ok=True)
+
+        prompt_temp = (
+            "Here is a paper description: \n"
+            "{paper_text} \n"
+            "Question: Which conference is this paper published in? "
+            "Give 5 likely conferences from {labels}. \n"
+            "Answer format is like: [conference1, conference2, conference3, conference4, conference5]. \n"
+            "And give your reason for the answer. \n"
+            "Answer: \n"
+            "Reason: \n"
+        )
+        prompt_temp_multi = (
+            f"Here are {batch_size} paper descriptions: \n"
+            "{paper_text} \n"
+            "Question: Which conference are these paper published in separately? "
+            "Give each paper 5 likely conferences from {labels}. \n"
+            "Format of answer for each paper is like: [conference1, conference2, conference3, conference4, conference5]. \n"
+            "And give your reason for each paper. \n"
+            "Answers: \n"
+            "Reasons: \n"
+        )
+        paper_text = self.load_rag_data()['paper_text']
+        for i in range(0, len(paper_text), batch_size):
+            if batch_size == 1:
+                prompt = prompt_temp.format(
+                    paper_text=paper_text[i],
+                    labels=self.labels,
+                )
+            else:
+                prompt = prompt_temp_multi.format(
+                    paper_text="\n".join(paper_text[i:i + batch_size]),
+                    labels=self.labels,
+                )
+
+            if persist:
+                # Save the prompt to a file
+                prompt_file = osp.join(persist_dir, f"prompt_{i // batch_size}.txt")
+                with open(prompt_file, "w") as f:
+                    f.write(prompt)
+            yield prompt
 
 
 class TLF2K(BaseLoadCls):
@@ -248,15 +302,8 @@ class TLF2K(BaseLoadCls):
     cnt_labels = len(labels)  # 11
 
     dataset_name = "tlf2k"
-    raw_dir = osp.join(RAW_DATA_ROOT_DIR, dataset_name)
-    rag_dir = osp.join(RAG_ROOT_DIR, dataset_name)
 
-    def __init__(self, rag_root_dir: str = RAG_ROOT_DIR) -> None:
-        self.rag_dir = osp.join(rag_root_dir, self.dataset_name)
-        if not osp.exists(self.rag_dir):
-            os.makedirs(self.rag_dir, exist_ok=True)
-
-    def build_tag(cls):
+    def build_tag(self):
         # load artist table
         def parse_type(x):
             if x == 'single':
@@ -278,46 +325,55 @@ class TLF2K(BaseLoadCls):
             else:
                 return "years active is unknown, "
 
-        artist_df = cls.load_raw_df("artists.csv")
-        text_attr = artist_df.apply(
+        def parse_unknown(x, head):
+            if pd.notna(x):
+                return head + str(x) + ", "
+            else:
+                return head[:-2] + "not known, "
+
+        artist_df = self.load_raw_df("artists.csv")
+        artist_df['artistID'] = artist_df['artistID'] -1  # reindex
+        artist_text_attr = artist_df.apply(
             lambda row: (
                 f"artist_id is: {row['artistID']}, "
-                + parse_type(row['type']) +
+                f"{parse_type(row['type'])}"
                 f"name is: {row['name']}, "
-                + parse_born(row['born'])
-                + parse_years_active(row['yearsActive']) +
-                f"location is: {row['location']}, " if pd.notna(row['location']) else "localtion is not known, "
-                f"biography is: {row['biography']}, " if pd.notna(row['biography']) else "biography is not known, "
+                f"{parse_born(row['born'])}"
+                f"{parse_years_active(row['yearsActive'])}"
+                f"{parse_unknown(row['location'], 'location is: ')}"
+                f"{parse_unknown(row['biography'], 'biography is: ')}"
                 f"personal url is: {row['url']}, "
                 # f"label is: {row['label']}."
             ),
             axis=1,
         )
-        artist_text_file = osp.join(cls.rag_dir, "artist_text.txt")
+        artist_text_file = osp.join(self.rag_dir, "artist_text.txt")
         with open(artist_text_file, "w") as f:
-            for text in text_attr:
+            for text in artist_text_attr:
                 f.write(text + "\n")
 
         # y
         y = artist_df["label"].values
-        y = [cls.labels.index(i.lower()) for i in y]
+        y = [self.labels.index(i.lower()) for i in y]
         y = torch.tensor(y, dtype=torch.long)
         torch.save(
             y,
-            osp.join(cls.rag_dir, "y.pt"),
+            osp.join(self.rag_dir, "y.pt"),
         )
         # print(y.unique())
 
         shutil.copy2(
-            osp.join(cls.raw_dir, "masks.pt"),
-            osp.join(cls.rag_dir, "masks.pt"),
+            osp.join(self.raw_dir, "masks.pt"),
+            osp.join(self.rag_dir, "masks.pt"),
         )
 
         hgraph = HeteroGraphData()
         pyg_graph = HeteroData()
         # Edges
         # load user_friends table
-        user_friends_df = cls.load_raw_df("user_friends.csv")
+        user_friends_df = self.load_raw_df("user_friends.csv")
+        user_friends_df['userID'] = user_friends_df['userID'] - 1  # reindex
+        user_friends_df['friendID'] = user_friends_df['friendID'] - 1
         # bi-directional edge
         edge_list = torch.tensor(
             user_friends_df[["userID", "friendID"]].values,
@@ -330,7 +386,9 @@ class TLF2K(BaseLoadCls):
         pyg_graph['user', 'friends_with', 'user'].edge_index = edge_list
 
         # load user_artists table
-        user_artists_df = cls.load_raw_df("user_artists.csv")
+        user_artists_df = self.load_raw_df("user_artists.csv")
+        user_artists_df['userID'] = user_artists_df['userID'] - 1  # reindex
+        user_artists_df['artistID'] = user_artists_df['artistID'] - 1
         edge_list = torch.tensor(
             user_artists_df[["userID", "artistID"]].values,
             dtype=torch.long,
@@ -344,20 +402,25 @@ class TLF2K(BaseLoadCls):
         hgraph['user', 'likes', 'artist'].listening_cnt = edge_weight
         pyg_graph['user', 'likes', 'artist'].listening_cnt = edge_weight
 
-        pyg_graph['user'].num_nodes = hgraph['user'].num_nodes = len(user_artists_df)  # TODO
+        num_users = user_artists_df['userID'].max() + 1 # 1892, userID is 0-1891
+
+        pyg_graph['user'].num_nodes = hgraph['user'].num_nodes = num_users  # TODO
         pyg_graph['artist'].num_nodes = hgraph['artist'].num_nodes = len(artist_df)
 
+        # pyg_graph['artist'].text = artist_text_attr.tolist()
+        pyg_graph['artist'].y = y
+        # pyg_graph['user'].text = ["UserId is " + str(i) for i in range(num_users)]
+
         print(hgraph)
-        hgraph.save(osp.join(cls.rag_dir, "tlf2k_graph.pkl"))
-        torch.save(pyg_graph, osp.join(cls.rag_dir, "pyg_graph.pt"))
+        print(pyg_graph)
+        hgraph.save(osp.join(self.rag_dir, "tlf2k_graph.pkl"))
+        torch.save(pyg_graph, osp.join(self.rag_dir, "pyg_graph.pt"))
 
     # sampled tape utility functions ##########################
-    @classmethod
-    def pyg_loader(cls, batch_size: int = 1) -> NeighborLoader:
+    def pyg_loader(self, batch_size: int = 1) -> NeighborLoader:
         # Create a NeighborLoader for the PyG graph
-        pyg_graph = cls.get_pyg_graph()
-        _, y = cls.get_dataset()
-        target_node_id = torch.arange(len(y), dtype=torch.long)
+        pyg_graph = self.get_pyg_graph()
+        # target_node_id = torch.arange(len(y), dtype=torch.long)
         num_neighbors = {
             ('user', 'friends_with', 'user'): [10, 5],
             ('user', 'likes', 'artist'): [10, 5],
@@ -367,9 +430,55 @@ class TLF2K(BaseLoadCls):
             num_neighbors=num_neighbors,
             batch_size=batch_size,
             shuffle=False,
-            input_nodes=target_node_id,
+            input_nodes="artist",
         )
         return loader
+
+    def prompt_set1_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
+        if persist:
+            persist_dir = osp.join(self.prompt_set1_dir, f"{batch_size}")
+            if not osp.exists(persist_dir):
+                os.makedirs(persist_dir, exist_ok=True)
+
+        prompt_temp = (
+            "Here is a music artist's description: \n"
+            "{artist_text} \n"
+            "Question: Which genre does this artist belong to? "
+            "Give 5 likely genres from {labels}. \n"
+            "Answer format is like: [genre1, genre2, genre3, genre4, genre5]. \n"
+            "And give your reason for the answer. \n"
+            "Answer: \n"
+            "Reason: \n"
+        )
+        prompt_temp_multi = (
+            f"Here are {batch_size} music artists' descriptions: \n"
+            "{artist_text} \n"
+            "Question: Which genres do these artists belong to separately? "
+            "Give 5 likely genres from {labels} separately. \n"
+            "Format of answer for each artist is like: [genre1, genre2, genre3, genre4, genre5]. \n"
+            "And give your reason for each artist. \n"
+            "Answers: \n"
+            "Reasons: \n"
+        )
+        artist_text = self.load_rag_data()['artist_text']
+        for i in range(0, len(artist_text), batch_size):
+            if batch_size == 1:
+                prompt = prompt_temp.format(
+                    artist_text=artist_text[i],
+                    labels=self.labels,
+                )
+            else:
+                prompt = prompt_temp_multi.format(
+                    artist_text="\n".join(artist_text[i:i + batch_size]),
+                    labels=self.labels,
+                )
+
+            if persist:
+                # Save the prompt to a file
+                prompt_file = osp.join(persist_dir, f"prompt_{i // batch_size}.txt")
+                with open(prompt_file, "w") as f:
+                    f.write(prompt)
+            yield prompt
 
 
 class TML1M(BaseLoadCls):
@@ -391,18 +500,10 @@ class TML1M(BaseLoadCls):
     cnt_labels = len(labels)  # 7
 
     dataset_name = "tml1m"
-    raw_dir = osp.join(RAW_DATA_ROOT_DIR, dataset_name)
-    rag_dir = osp.join(RAG_ROOT_DIR, dataset_name)
 
-    def __init__(self, rag_root_dir: str = RAG_ROOT_DIR) -> None:
-        self.rag_dir = osp.join(rag_root_dir, self.dataset_name)
-        if not osp.exists(self.rag_dir):
-            os.makedirs(self.rag_dir, exist_ok=True)
-
-    @classmethod
-    def build_tag(cls):
+    def build_tag(self):
         # load user table
-        user_df = cls.load_raw_df("users.csv")
+        user_df = self.load_raw_df("users.csv")
         text_attr = user_df.apply(
             lambda row: (
                 f"UserID is: {row['UserID']}, "
@@ -413,56 +514,61 @@ class TML1M(BaseLoadCls):
             ),
             axis=1,
         )
-        user_text_file = osp.join(cls.rag_dir, "user_text.txt")
+        user_text_file = osp.join(self.rag_dir, "user_text.txt")
         with open(user_text_file, "w") as f:
             for text in text_attr:
                 f.write(text + "\n")
 
+        def parse_unknown(x, head):
+            if pd.notna(x):
+                return head + str(x) + ", "
+            else:
+                return head[:-2] + "not known, "
+
         # load movie table
-        movie_df = cls.load_raw_df("movies.csv")
+        movie_df = self.load_raw_df("movies.csv")
         text_attr = movie_df.apply(
             lambda row: (
                 f"MovieID is: {row['MovieID']}, "
                 f"Title is: {row['Title']}, "
-                f"Year is: {row['Year']}, " if pd.notna(row['Year']) else "Year is not known, "
-                f"Genres are: {row['Genres']}, "
-                f"Director is: {row['Director']}, " if pd.notna(row['Director']) else "Director is not known, "
-                f"Cast is: {row['Cast']}, " if pd.notna(row['Cast']) else "Cast is not known, "
-                f"Runtime is: {row['Runtime']}, " if pd.notna(row['Runtime']) else "Runtime is not known, "
-                f"Languages is: {row['Languages']}, " if pd.notna(row['Languages']) else "Languages is not known, "
-                f"Certificate code is: {row['Certificate']}, " if pd.notna(row['Certificate'])
-                else "Certificate code is not known, "
-                f"Plot is: {row['Plot']}, " if pd.notna(row['Plot']) else "Plot is not known, "
+                f"{parse_unknown(row['Year'], 'Year is: ')}"
+                f"Genres are: {row['Genre']}, "
+                f"{parse_unknown(row['Director'], 'Director is: ')}"
+                f"{parse_unknown(row['Cast'], 'Cast is: ')}"
+                f"{parse_unknown(row['Runtime'], 'Runtime is: ')}"
+                f"{parse_unknown(row['Languages'], 'Languages is: ')}"
+                f"{parse_unknown(row['Certificate'], 'Certificate code is: ')}"
+                f"{parse_unknown(row['Plot'], 'Plot is: ')}"
                 f"Url is: {row['Url']}."
             ),
             axis=1,
         )
-        movie_text_file = osp.join(cls.rag_dir, "movie_text.txt")
+        movie_text_file = osp.join(self.rag_dir, "movie_text.txt")
         with open(movie_text_file, "w") as f:
             for text in text_attr:
                 f.write(text + "\n")
 
         # y
         y = user_df["Age"].values
-        y = [cls.labels.index(i) for i in y]
+        y = [self.labels.index(i) for i in y]
         y = torch.tensor(y, dtype=torch.long)
         torch.save(
             y,
-            osp.join(cls.rag_dir, "y.pt"),
+            osp.join(self.rag_dir, "y.pt"),
         )
         # print(y.unique())
 
         # masks
         shutil.copy2(
-            osp.join(cls.raw_dir, "masks.pt"),
-            osp.join(cls.rag_dir, "masks.pt"),
+            osp.join(self.raw_dir, "masks.pt"),
+            osp.join(self.rag_dir, "masks.pt"),
         )
 
         hgraph = HeteroGraphData()
         pyg_graph = HeteroData()
         # Edges
         # load ratings table
-        ratings_df = cls.load_raw_df("ratings.csv")
+        ratings_df = self.load_raw_df("ratings.csv")
         edge_list = torch.tensor(
             ratings_df[["UserID", "MovieID"]].values,
             dtype=torch.long,
@@ -485,17 +591,19 @@ class TML1M(BaseLoadCls):
         pyg_graph['user'].num_nodes = hgraph['user'].num_nodes = len(user_df)
         pyg_graph['movie'].num_nodes = hgraph['movie'].num_nodes = len(movie_df)
 
+        pyg_graph['user'].y = y
+
         print(hgraph)
-        hgraph.save(osp.join(cls.rag_dir, "tml1m_graph.pkl"))
-        torch.save(pyg_graph, osp.join(cls.rag_dir, "pyg_graph.pt"))
+        print(pyg_graph)
+        hgraph.save(osp.join(self.rag_dir, "tml1m_graph.pkl"))
+        torch.save(pyg_graph, osp.join(self.rag_dir, "pyg_graph.pt"))
 
     # sampled tape utility functions ##########################
-    @classmethod
-    def pyg_loader(cls, batch_size: int = 1) -> NeighborLoader:
+    def pyg_loader(self, batch_size: int = 1) -> NeighborLoader:
         # Create a NeighborLoader for the PyG graph
-        pyg_graph = cls.get_pyg_graph()
-        _, y = cls.get_dataset()
-        target_node_id = torch.arange(len(y), dtype=torch.long)
+        pyg_graph = self.get_pyg_graph()
+        _, y = self.get_dataset()
+        # target_node_id = torch.arange(len(y), dtype=torch.long)
         num_neighbors = {
             ('user', 'rates', 'movie'): [10, 5],
         }
@@ -504,26 +612,85 @@ class TML1M(BaseLoadCls):
             num_neighbors=num_neighbors,
             batch_size=batch_size,
             shuffle=False,
-            input_nodes=target_node_id,
+            input_nodes="user",
         )
         return loader
 
+    def prompt_set1_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
+        print_warning(
+            "user table in TML1M contains very little information, "
+            "so this prompt may not be very useful. "
+        )
+        if persist:
+            persist_dir = osp.join(self.prompt_set1_dir, f"{batch_size}")
+            if not osp.exists(persist_dir):
+                os.makedirs(persist_dir, exist_ok=True)
 
-TACM12K.build_tag()
-loader = TACM12K.pyg_loader(batch_size=2)
-for batch in loader:
-    # batch is a dict with keys 'paper', 'author', and 'user'
-    # each key contains a batch of nodes and their neighbors
-    print(batch)
-    break
-# g = tacm.pyg_graph()
+        prompt_temp = (
+            "Here is a moive rating website user's description: \n"
+            "{user_text} \n"
+            "Question: What is the user's age? "
+            "Give 5 likely age from {labels}. \n"
+            "Answer format is like: [age1, age2, age3, age4, age5]. \n"
+            "And give your reason for the answer. \n"
+            "Answer: \n"
+            "Reason: \n"
+        )
+        prompt_temp_multi = (
+            f"Here are {batch_size} moive rating website userss descriptions: \n"
+            "{user_text} \n"
+            "Question: What are these users' age separately? "
+            "Give 5 likely age from {labels} separately. \n"
+            "Format of answer for each user is like: [age1, age2, age3, age4, age5]. \n"
+            "And give your reason for each user. \n"
+            "Answers: \n"
+            "Reasons: \n"
+        )
+        user_text = self.load_rag_data()['user_text']
+        for i in range(0, len(user_text), batch_size):
+            if batch_size == 1:
+                prompt = prompt_temp.format(
+                    user_text=user_text[i],
+                    labels=self.labels,
+                )
+            else:
+                prompt = prompt_temp_multi.format(
+                    user_text="\n".join(user_text[i:i + batch_size]),
+                    labels=self.labels,
+                )
 
-# tacm.build_tag()
+            if persist:
+                # Save the prompt to a file
+                prompt_file = osp.join(persist_dir, f"prompt_{i // batch_size}.txt")
+                with open(prompt_file, "w") as f:
+                    f.write(prompt)
+            yield prompt
 
-# tlf2k = TLF2K()
-# tlf2k.build_tag()
 
-# tml1m = TML1M()
-# tml1m.build_tag()
+# Script functions ############################################
+def build_all():
+    r"""Build all datasets."""
+    print_warning(
+        "This will take a long time, "
+        "please run it in the background. "
+        "You can also run it separately in the terminal."
+    )
+    for i in [TACM12K, TLF2K, TML1M]:
+        tmp_ins: BaseLoadCls = i()
+        print(f"Build {i.__name__} dataset done.")
+        print("Building tag data ...")
+        tmp_ins.build_tag()
+        print("Building prompt 1 (TAPE prompt) ...")
+        for _ in tmp_ins.prompt_set1_loader(batch_size=1):
+            continue
+        for _ in tmp_ins.prompt_set1_loader(batch_size=5):
+            continue
+        for _ in tmp_ins.prompt_set1_loader(batch_size=10):
+            continue
 
-# TACM12K.load_all()
+    print_success(
+        "Done."
+    )
+
+
+# build_all()

@@ -11,4 +11,6 @@ EMBEDDING_MODEL = os.path.join(root_, "bge-large-en-v1.5")
 
 # data path
 RAW_DATA_ROOT_DIR = os.path.join(root_, "data")
-RAG_ROOT_DIR = os.path.join(root_, "rag_data")
+TAG_ROOT_DIR = os.path.join(root_, "tag_data")
+PROMPT_1_DIR = os.path.join(root_, "prompt_1")
+PROMPT_2_DIR = os.path.join(root_, "prompt_2")
