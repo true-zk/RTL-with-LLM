@@ -4,18 +4,30 @@ import shutil
 from typing import Optional, Union, Dict, Tuple, List, Generator
 import json
 
+import pandas as pd
 import torch
 from torch import Tensor
-import pandas as pd
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import NeighborLoader
 
 from rllm.data import HeteroGraphData
 
-from config import RAW_DATA_ROOT_DIR, TAG_ROOT_DIR, PROMPT_1_DIR, PROMPT_2_DIR
+from config import (
+    RAW_DATA_ROOT_DIR,
+    TAG_ROOT_DIR,
+    PROMPT_1_DIR,
+    PROMPT_2_DIR,
+    PROMPT_LEN_LOG_DIR,
+)
 from llm import llm
 from bge_model import embed_model, tokenizer
-from utils import print_warning, print_success, print_danger
+from utils import (
+    print_warning,
+    print_success,
+    wrapper_log_str_len,
+    wrapper_timer,
+    wrapper_cmd_logger,
+)
 
 
 class BaseLoadCls:
@@ -106,17 +118,31 @@ class BaseLoadCls:
         for i in idx:
             yield texts[i]
 
-    def gen_edge_prompt(self, edge_type: List[str], batch: HeteroData) -> str:
+    def gen_edge_prompt(
+        self,
+        edge_type: List[str],
+        batch: HeteroData,
+        edge_weight: Optional[str] = None,
+    ) -> str:
         edges: Tensor = batch[edge_type[0], edge_type[1], edge_type[2]].edge_index
+        if edge_weight is not None:
+            weights = batch[edge_type[0], edge_type[1], edge_type[2]][edge_weight]
         if edges.numel() == 0:
             return ""
         edge_prompt = ""
         for i in range(edges.shape[1]):
-            edge_prompt += (
-                f"『{edge_type[0]} node {edges[0][i]}』 "
-                f"-- {edge_type[1]} --> "
-                f"『{edge_type[2]} node {edges[1][i]}』\n"
-            )
+            if edge_weight is not None:
+                edge_prompt += (
+                    f"『{edge_type[0]} node {edges[0][i]}』 "
+                    f"-- {edge_type[1]} (weight: {weights[i].item()}) --> "
+                    f"『{edge_type[2]} node {edges[1][i]}』\n"
+                )
+            else:
+                edge_prompt += (
+                    f"『{edge_type[0]} node {edges[0][i]}』 "
+                    f"-- {edge_type[1]} --> "
+                    f"『{edge_type[2]} node {edges[1][i]}』\n"
+                )
         return edge_prompt
 
     # abstract methods ########################################
@@ -273,9 +299,10 @@ class TACM12K(BaseLoadCls):
         )
         return loader
 
+    @wrapper_log_str_len
     def prompt_set1_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
         if persist:
-            persist_dir = osp.join(self.prompt_set1_dir, f"{batch_size}")
+            persist_dir = self.prompt_set1_dir
             if not osp.exists(persist_dir):
                 os.makedirs(persist_dir, exist_ok=True)
 
@@ -300,6 +327,8 @@ class TACM12K(BaseLoadCls):
             "Reasons: \n"
         )
         paper_text = self.load_rag_data()['paper_text']
+
+        res = []
         for i in range(0, len(paper_text), batch_size):
             if batch_size == 1:
                 prompt = prompt_temp.format(
@@ -312,13 +341,15 @@ class TACM12K(BaseLoadCls):
                     labels=self.labels,
                 )
 
-            if persist:
-                # Save the prompt to a file
-                prompt_file = osp.join(persist_dir, f"prompt_{i // batch_size}.txt")
-                with open(prompt_file, "w") as f:
-                    f.write(prompt)
             yield prompt
+            res.append(prompt)
 
+        if persist:
+            prompt_file = osp.join(persist_dir, f"{batch_size}.json")
+            with open(prompt_file, "w") as f:
+                json.dump(res, f)
+
+    @wrapper_log_str_len
     def prompt_set2_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
         r"""Return a generator for sampled TAPE prompt.
         If `persist`, save the prompts to 'prompt_set2_dir/{dataset_name}/{batch_size}.json'.
@@ -329,11 +360,21 @@ class TACM12K(BaseLoadCls):
                 os.makedirs(persist_dir, exist_ok=True)
 
         prompt_head = (
-            "You are dealing with a small knowledge graph of nodes and edges."
+            "You are dealing with a small heterogeneous knowledge graph of nodes and edges. \n"
+            "You have to answer the question based on the graph. \n"
             "Each node in the graph contains a text description, and "
-            "the edge represents the relationship between nodes and the direction of information transmission."
+            "the edge represents the relationship between nodes and the direction of information transmission. \n"
             "The graph is: \n"
         )
+
+        prompt_tail = (
+            "Question: Which conference is 『**Target** Paper node 0』 published in? "
+            "Give 5 likely conferences from {labels}. \n"
+            "Answer format is like: [conference1, conference2, conference3, conference4, conference5]. \n"
+            "And give your reason for the answer. \n"
+            "Answer: \n"
+            "Reason: \n"
+        ).format(labels=self.labels)
 
         pyg_neighbor_loader = self.pyg_loader(batch_size)
         paper_text = self.load_rag_data()['paper_text']
@@ -346,7 +387,10 @@ class TACM12K(BaseLoadCls):
 
             nodes = "\n Paper nodes:\n"
             for j, el in enumerate(self.text_attr_fetch(paper_text, batch['paper'].n_id)):
-                nodes += f"『Paper node {j}』, description: {el}\n"
+                if j == 0:
+                    nodes += f"『**Target** Paper node {j}』, description: {el}\n"
+                else:
+                    nodes += f"『Paper node {j}』, description: {el}\n"
 
             nodes += "\n Author nodes:\n"
             for j, el in enumerate(self.text_attr_fetch(author_text, batch['author'].n_id)):
@@ -361,6 +405,7 @@ class TACM12K(BaseLoadCls):
             )
 
             prompt = prompt_head + num_nodes + nodes + edges
+            prompt += prompt_tail
             yield prompt
             res.append(prompt)
 
@@ -469,9 +514,10 @@ class TLF2K(BaseLoadCls):
             user_friends_df[["userID", "friendID"]].values,
             dtype=torch.long,
         ).T
-        rev_edge_list = edge_list.flip(0)
-        edge_list = torch.cat([edge_list, rev_edge_list], dim=1)
         hgraph['user', 'friends_with', 'user'].edge_index = edge_list
+
+        from torch_geometric.utils import to_undirected
+        edge_list = to_undirected(edge_list)
         pyg_graph['user', 'friends_with', 'user'].edge_index = edge_list
 
         # load user_artists table
@@ -484,12 +530,17 @@ class TLF2K(BaseLoadCls):
         ).T
         hgraph['user', 'likes', 'artist'].edge_index = edge_list
         pyg_graph['user', 'likes', 'artist'].edge_index = edge_list
+
+        edge_list = edge_list.flip(0)
+        pyg_graph['artist', 'rev_likes', 'user'].edge_index = edge_list
+
         edge_weight = torch.tensor(
             user_artists_df["weight"].values,
             dtype=torch.long,
         )
         hgraph['user', 'likes', 'artist'].listening_cnt = edge_weight
         pyg_graph['user', 'likes', 'artist'].listening_cnt = edge_weight
+        pyg_graph['artist', 'rev_likes', 'user'].listening_cnt = edge_weight
 
         num_users = user_artists_df['userID'].max() + 1 # 1892, userID is 0-1891
 
@@ -511,8 +562,9 @@ class TLF2K(BaseLoadCls):
         pyg_graph = self.get_pyg_graph()
         # target_node_id = torch.arange(len(y), dtype=torch.long)
         num_neighbors = {
-            ('user', 'friends_with', 'user'): [5],
-            ('user', 'likes', 'artist'): [5],
+            ('user', 'friends_with', 'user'): [5, 0],
+            ('user', 'likes', 'artist'): [5, 0],
+            ('artist', 'rev_likes', 'user'): [5, 1],
         }
         loader = NeighborLoader(
             pyg_graph,
@@ -523,9 +575,10 @@ class TLF2K(BaseLoadCls):
         )
         return loader
 
+    @wrapper_log_str_len
     def prompt_set1_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
         if persist:
-            persist_dir = osp.join(self.prompt_set1_dir, f"{batch_size}")
+            persist_dir = self.prompt_set1_dir
             if not osp.exists(persist_dir):
                 os.makedirs(persist_dir, exist_ok=True)
 
@@ -550,6 +603,8 @@ class TLF2K(BaseLoadCls):
             "Reasons: \n"
         )
         artist_text = self.load_rag_data()['artist_text']
+
+        res = []
         for i in range(0, len(artist_text), batch_size):
             if batch_size == 1:
                 prompt = prompt_temp.format(
@@ -562,15 +617,16 @@ class TLF2K(BaseLoadCls):
                     labels=self.labels,
                 )
 
-            if persist:
-                # Save the prompt to a file
-                prompt_file = osp.join(persist_dir, f"prompt_{i // batch_size}.txt")
-                with open(prompt_file, "w") as f:
-                    f.write(prompt)
             yield prompt
+            res.append(prompt)
 
+        if persist:
+            prompt_file = osp.join(persist_dir, f"{batch_size}.json")
+            with open(prompt_file, "w") as f:
+                json.dump(res, f)
+
+    @wrapper_log_str_len
     def prompt_set2_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
-        # TODO 只采样一阶邻居不够，需要采样friends然后再采样一阶artist
         r"""Return a generator for sampled TAPE prompt.
         If `persist`, save the prompts to 'prompt_set2_dir/{dataset_name}/{batch_size}.json'.
         """
@@ -587,34 +643,41 @@ class TLF2K(BaseLoadCls):
         )
 
         prompt_tail = (
-            ""
-        )
+            "Question: Which genre does 『**Target** Artist node 0』 belong to? "
+            "Give 5 likely genres from {labels}. \n"
+            "Answer format is like: [genre1, genre2, genre3, genre4, genre5]. \n"
+            "And give your reason for the answer. \n"
+            "Answer: \n"
+            "Reason: \n"
+        ).format(labels=self.labels)
 
         pyg_neighbor_loader = self.pyg_loader(batch_size)
         artist_text = self.load_rag_data()['artist_text']
 
         res = []
         for batch in pyg_neighbor_loader:
-            num_nodes = f"Number of artist nodes: {batch['artist'].num_nodes}.\n"
-            num_nodes += f"Number of user nodes: {batch['user'].num_nodes}.\n"
+            num_nodes = f"Number of Artist nodes: {batch['artist'].num_nodes}.\n"
+            num_nodes += f"Number of User nodes: {batch['user'].num_nodes}.\n"
 
-            nodes = "\n Paper nodes:\n"
-            for j, el in enumerate(self.text_attr_fetch(paper_text, batch['paper'].n_id)):
-                nodes += f"『Paper node {j}』, description: {el}\n"
+            nodes = "\n Artist nodes:\n"
+            for j, el in enumerate(self.text_attr_fetch(artist_text, batch['artist'].n_id)):
+                nodes += f"『Artist node {j}』, description: {el}\n"
 
-            nodes += "\n Author nodes:\n"
-            for j, el in enumerate(self.text_attr_fetch(author_text, batch['author'].n_id)):
-                nodes += f"『Author node {j}』, description: {el}\n"
+            for j, _ in enumerate(batch['user'].n_id):
+                nodes += f"『User node {j}』\n"
 
             edges = "\n Edges:\n"
             edges += self.gen_edge_prompt(
-                ['paper', 'cited_by', 'paper'], batch
+                ['user', 'likes', 'artist'], batch, "listening_cnt"
             )
             edges += self.gen_edge_prompt(
-                ['author', 'writes', 'paper'], batch
+                ['user', 'friends_with', 'user'], batch
+            )
+            edges += self.gen_edge_prompt(
+                ['artist', 'rev_likes', 'user'], batch, "listening_cnt"
             )
 
-            prompt = prompt_head + num_nodes + nodes + edges
+            prompt = prompt_head + num_nodes + nodes + edges + prompt_tail
             yield prompt
             res.append(prompt)
 
@@ -646,6 +709,7 @@ class TML1M(BaseLoadCls):
     def build_tag(self):
         # load user table
         user_df = self.load_raw_df("users.csv")
+        user_df['UserID'] = user_df['UserID'] - 1  # reindex
         text_attr = user_df.apply(
             lambda row: (
                 f"UserID is: {row['UserID']}, "
@@ -669,6 +733,7 @@ class TML1M(BaseLoadCls):
 
         # load movie table
         movie_df = self.load_raw_df("movies.csv")
+        movie_df['MovieID'] = movie_df['MovieID'] - 1  # reindex
         text_attr = movie_df.apply(
             lambda row: (
                 f"MovieID is: {row['MovieID']}, "
@@ -711,24 +776,33 @@ class TML1M(BaseLoadCls):
         # Edges
         # load ratings table
         ratings_df = self.load_raw_df("ratings.csv")
+        ratings_df['UserID'] = ratings_df['UserID'] - 1  # reindex
+        ratings_df['MovieID'] = ratings_df['MovieID'] - 1  # reindex
         edge_list = torch.tensor(
             ratings_df[["UserID", "MovieID"]].values,
             dtype=torch.long,
         ).T
         hgraph['user', 'rates', 'movie'].edge_index = edge_list
         pyg_graph['user', 'rates', 'movie'].edge_index = edge_list
+
+        rev_edge_list = edge_list.flip(0)
+        pyg_graph['movie', 'rated_by', 'user'].edge_index = rev_edge_list
+
         edge_weight = torch.tensor(
             ratings_df["Rating"].values,
             dtype=torch.float,
         )
         hgraph['user', 'rates', 'movie'].rating = edge_weight
         pyg_graph['user', 'rates', 'movie'].rating = edge_weight
+        pyg_graph['movie', 'rated_by', 'user'].rating = edge_weight
+
         time_stamp = torch.tensor(
             ratings_df["Timestamp"].values,
             dtype=torch.long,
         )
         hgraph['user', 'rates', 'movie'].time_stamp = time_stamp
-        pyg_graph['user', 'rates', 'movie'].time_stamp = time_stamp
+        # pyg_graph['user', 'rates', 'movie'].time_stamp = time_stamp
+        pyg_graph['movie', 'rated_by', 'user'].time_stamp = time_stamp
 
         pyg_graph['user'].num_nodes = hgraph['user'].num_nodes = len(user_df)
         pyg_graph['movie'].num_nodes = hgraph['movie'].num_nodes = len(movie_df)
@@ -744,10 +818,11 @@ class TML1M(BaseLoadCls):
     def pyg_loader(self, batch_size: int = 1) -> NeighborLoader:
         # Create a NeighborLoader for the PyG graph
         pyg_graph = self.get_pyg_graph()
-        _, y = self.get_dataset()
+        # _, y = self.get_dataset()
         # target_node_id = torch.arange(len(y), dtype=torch.long)
         num_neighbors = {
-            ('user', 'rates', 'movie'): [10, 5],
+            ('movie', 'rated_by', 'user'): [5, 0],
+            ('user', 'rates', 'movie'): [0, 2],
         }
         loader = NeighborLoader(
             pyg_graph,
@@ -758,13 +833,14 @@ class TML1M(BaseLoadCls):
         )
         return loader
 
+    @wrapper_log_str_len
     def prompt_set1_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
         print_warning(
             "user table in TML1M contains very little information, "
             "so this prompt may not be very useful. "
         )
         if persist:
-            persist_dir = osp.join(self.prompt_set1_dir, f"{batch_size}")
+            persist_dir = self.prompt_set1_dir
             if not osp.exists(persist_dir):
                 os.makedirs(persist_dir, exist_ok=True)
 
@@ -789,6 +865,8 @@ class TML1M(BaseLoadCls):
             "Reasons: \n"
         )
         user_text = self.load_rag_data()['user_text']
+
+        res = []
         for i in range(0, len(user_text), batch_size):
             if batch_size == 1:
                 prompt = prompt_temp.format(
@@ -801,49 +879,155 @@ class TML1M(BaseLoadCls):
                     labels=self.labels,
                 )
 
-            if persist:
-                # Save the prompt to a file
-                prompt_file = osp.join(persist_dir, f"prompt_{i // batch_size}.txt")
-                with open(prompt_file, "w") as f:
-                    f.write(prompt)
             yield prompt
+            res.append(prompt)
+
+        if persist:
+            prompt_file = osp.join(persist_dir, f"{batch_size}.json")
+            with open(prompt_file, "w") as f:
+                json.dump(res, f)
+
+    @wrapper_log_str_len
+    def prompt_set2_loader(self, batch_size: int = 1, persist: bool = True) -> Generator:
+        r"""Return a generator for sampled TAPE prompt.
+        If `persist`, save the prompts to 'prompt_set2_dir/{dataset_name}/{batch_size}.json'.
+        """
+        if persist:
+            persist_dir = self.prompt_set2_dir
+            if not osp.exists(persist_dir):
+                os.makedirs(persist_dir, exist_ok=True)
+
+        prompt_head = (
+            "You are dealing with a small knowledge graph of nodes and edges."
+            "Each node in the graph contains a text description, and "
+            "the edge represents the relationship between nodes and the direction of information transmission."
+            "The graph is: \n"
+        )
+
+        prompt_tail = (
+            "Question: What is the 『**Target** User node 0』's age? "
+            "Give 5 likely age from {labels}. \n"
+            "Answer format is like: [age1, age2, age3, age4, age5]. \n"
+            "And give your reason for the answer. \n"
+            "Answer: \n"
+            "Reason: \n"
+        ).format(labels=self.labels)
+
+        pyg_neighbor_loader = self.pyg_loader(batch_size)
+        movie_text = self.load_rag_data()['movie_text']
+        user_text = self.load_rag_data()['user_text']
+
+        res = []
+        for batch in pyg_neighbor_loader:
+            num_nodes = f"Number of User nodes: {batch['user'].num_nodes}.\n"
+            num_nodes += f"Number of Movie nodes: {batch['movie'].num_nodes}.\n"
+
+            nodes = "\n User nodes:\n"
+            for j, el in enumerate(self.text_attr_fetch(user_text, batch['user'].n_id)):
+                nodes += f"『User node {j}』, description: {el}\n"
+
+            for j, el in enumerate(self.text_attr_fetch(movie_text, batch['movie'].n_id)):
+                nodes += f"『Movie node {j}』, description: {el}\n"
+
+            edges = "\n Edges:\n"
+            edges += self.gen_edge_prompt(
+                ['movie', 'rated_by', 'user'], batch, "rating"
+            )
+            edges += self.gen_edge_prompt(
+                ['user', 'rates', 'movie'], batch
+            )
+
+            prompt = prompt_head + num_nodes + nodes + edges + prompt_tail
+            yield prompt
+            res.append(prompt)
+
+        if persist:
+            prompt_file = osp.join(persist_dir, f"{batch_size}.json")
+            with open(prompt_file, "w") as f:
+                json.dump(res, f)
 
 
 # Script functions ############################################
-
 datasets = [TACM12K, TLF2K, TML1M]
 
-def apply_all(fn: str, *args, **kwargs):
-    r"""Apply a function to all datasets."""
+
+@wrapper_timer
+def build_tag():
+    r"""Build all tag datasets."""
+    print("Building tag datasets ...")
     for cls in datasets:
+        print(f"Building {cls.__name__} ...")
         ins = cls()
-        if hasattr(ins, fn):
-            method = getattr(ins, fn)
-            if callable(method):
-                print(f"Applying {fn} to {cls.__name__} ...")
-                method(*args, **kwargs)
-            else:
-                print_danger(f"{fn} is not a callable method.")
-                raise ValueError(f"{fn} is not a callable method.")
+        method = getattr(ins, 'build_tag')
+        method()
     print_success(
-        f"Applied {fn} to all datasets."
+        f"Built all tag datasets."
     )
 
-def build_tag():
-    apply_all("build_tag")
 
-def build_prompt1():
-    r"""Build all datasets."""
+@wrapper_timer
+def build_prompt1(log_dir: str = PROMPT_LEN_LOG_DIR):
+    r"""Build all prompt_set1."""
+    print("Building prompt_set1 ...")
+    if not osp.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+    log_path = osp.join(log_dir, "prompt_set1.json")
+    print(f"Prompt set1 log path: {log_path}")
+    res = dict()
     for i in [1, 5, 10]:
-        apply_all("prompt_set1_loader", i, True)
+        print(f"Batch size: {i}")
+        for cls in datasets:
+            print(f"Building {cls.__name__} ...")
+            ins = cls()
+            gen = getattr(ins, 'prompt_set1_loader')
+            gen = gen(batch_size=i, persist=True)
+            for _ in gen:
+                pass
+            res[cls.__name__ + f'batch_size{i}'] = gen.lens
+
+    with open(log_path, "w") as f:
+        json.dump(res, f)
+
+    print_success(
+        f"Built all prompt_set1 datasets."
+    )
 
 
-a = TACM12K()
-# a.build_tag()
-for i in a.prompt_set2_loader():
-    continue
+@wrapper_timer
+def build_prompt2(log_dir: str = PROMPT_LEN_LOG_DIR):
+    r"""Build all prompt_set2."""
+    print("Building prompt_set2 ...")
+    if not osp.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+    log_path = osp.join(log_dir, "prompt_set2.json")
+    print(f"Prompt set2 log path: {log_path}")
+    res = dict()
+    for i in [1]:
+        print(f"Batch size: {i}")
+        for cls in datasets:
+            print(f"Building {cls.__name__} ...")
+            ins = cls()
+            gen = getattr(ins, 'prompt_set2_loader')
+            gen = gen(batch_size=i, persist=True)
+            for _ in gen:
+                pass
+            res[cls.__name__ + f'batch_size{i}'] = gen.lens
 
-with open("prompt_2/tacm12k/1.json", "r") as f:
-    data = json.load(f)
-print(len(data))
-print(data[0])
+    with open(log_path, "w") as f:
+        json.dump(res, f)
+
+    print_success(
+        f"Built all prompt_set1 datasets."
+    )
+
+
+@wrapper_cmd_logger
+def pipeline():
+    r"""Main function."""
+    build_tag()
+    build_prompt1()
+    build_prompt2()
+
+
+if __name__ == "__main__":
+    pipeline()
