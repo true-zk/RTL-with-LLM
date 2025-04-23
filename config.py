@@ -2,8 +2,8 @@ import os
 root_ = os.path.dirname(os.path.abspath(__file__))
 
 # llm api
-BASE_URL = "http://111.186.56.172:3000/v1"
-API_KEY = "sk-e9ZHXSwNdl1gz43v135aCa39A8A943FeBeA059703a6dAfE5"
+BASE_URL = ""
+API_KEY = ""
 MODEL_NAME = "deepseek-chat"
 
 # embedding model

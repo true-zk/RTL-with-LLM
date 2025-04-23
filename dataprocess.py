@@ -21,7 +21,7 @@ from config import (
 )
 from llm import llm
 from bge_model import embed_model, tokenizer
-from utils import (
+from _utils import (
     print_warning,
     print_success,
     wrapper_log_str_len,
@@ -57,7 +57,7 @@ class BaseLoadCls:
         if not osp.exists(self.prompt_set2_dir):
             os.makedirs(self.prompt_set2_dir, exist_ok=True)
 
-        self.raw_dir = osp.join(RAW_DATA_ROOT_DIR, self.dataset_name)
+        self.raw_dir = osp.join(RAW_DATA_ROOT_DIR, self.dataset_name, "raw")
         self.rag_dir = osp.join(TAG_ROOT_DIR, self.dataset_name)
         self.prompt_set1_dir = osp.join(PROMPT_1_DIR, self.dataset_name)
 
