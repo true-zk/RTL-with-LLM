@@ -1,11 +1,14 @@
 import sys
 import os
 import os.path as osp
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, List
 from functools import partial, wraps
 from colorama import Fore, Style
 from time import time
 from datetime import datetime
+
+import torch
+from torch import Tensor
 
 from config import CMD_LOG_DIR
 
@@ -110,3 +113,87 @@ def wrapper_cmd_logger(func_or_path: Optional[Union[str, Callable]] = None):
         # If the first argument is a string, treat it as the log path
         log_path = func_or_path
         return partial(decorator, log_path=log_path)
+
+
+y2label_map_dict = {
+    'tacm12k': {
+        0: "KDD",
+        1: "CIKM",
+        2: "WWW",
+        3: "SIGIR",
+        4: "STOC",
+        5: "MobiCOMM",
+        6: "SIGMOD",
+        7: "SIGCOMM",
+        8: "SPAA",
+        9: "ICML",
+        10: "VLDB",
+        11: "SOSP",
+        12: "SODA",
+        13: "COLT",
+        14: "[UNK]",
+    },
+    'tlf2k': {
+        0: 'country',
+        1: 'electronic',
+        2: 'hip-hop',
+        3: 'jazz',
+        4: 'latin',
+        5: 'pop',
+        6: 'punk',
+        7: 'reggae',
+        8: 'rock',
+        9: 'metal',
+        10: 'soul'
+    }
+}
+
+label2y_map_dict = {
+    'tacm12k': {
+        "KDD": 0,
+        "CIKM": 1,
+        "WWW": 2,
+        "SIGIR": 3,
+        "STOC": 4,
+        "MobiCOMM": 5,
+        "SIGMOD": 6,
+        "SIGCOMM": 7,
+        "SPAA": 8,
+        "ICML": 9,
+        "VLDB": 10,
+        "SOSP": 11,
+        "SODA": 12,
+        "COLT": 13,
+        "[UNK]": 14,
+    },
+    'tlf2k': {
+        'country': 0,
+        'electronic': 1,
+        'hip-hop': 2,
+        'jazz': 3,
+        'latin': 4,
+        'pop': 5,
+        'punk': 6,
+        'reggae': 7,
+        'rock': 8,
+        'metal': 9,
+        'soul': 10
+    }
+}
+
+
+def llm_preds_2_enhence_vec(
+    llm_preds_l: List[List[str]],
+    dataset_name: str,
+    repeat_l: List[int] = [5, 3, 2, 1, 1]
+) -> Tensor:
+    vec = []
+    mapping = label2y_map_dict[dataset_name]
+
+    for el in llm_preds_l:
+        assert len(el) == len(repeat_l)
+        tmp = [x for i, v in enumerate(el)
+               for x in ([mapping[v]] * repeat_l[i] if v in mapping else [mapping['[UNK]']] * repeat_l[i])]
+        vec.append(torch.tensor(tmp))
+
+    return torch.stack(vec, dim=0)

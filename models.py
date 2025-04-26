@@ -151,29 +151,65 @@ from rllm.nn.models import TableEncoder, GraphEncoder
 from rllm.nn.conv.graph_conv import HANConv
 
 
+class ImportanceEncoder(torch.nn.Module):
+    def __init__(
+        self,
+        num_labels: int,
+        embed_dim: int,
+        input_size: int = 5,
+        weight: List[int] = [1, 1, 1, 1, 1],
+    ):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(num_labels, embed_dim)
+        assert input_size == len(weight)
+        self.input_size = input_size
+        self._weight = torch.tensor(weight, dtype=torch.float32)
+        self.register_buffer("weight", self._weight)  # register as buffer
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.embedding(x)  # (B, 5) -> (B, 5, embed_dim)
+        x = x * self.weight.view(1, self.input_size, 1)
+        x = x.view(-1, self.input_size * x.size(2))  # (B, 5, embed_dim) -> (B, 5 * embed_dim)
+        return x
+
+
 class MultiTableBridge(torch.nn.Module):
     def __init__(
         self,
         target_table: str,
-        table_dim: Dict[str, int],
+        lin_input_dim_dict: Dict[str, int],
         graph_dim: int,
         table_encoder_dict: Dict[str, TableEncoder],
         graph_encoder: GraphEncoder,
+        *,
+        dropout: float = 0.5,
+        llm_vec_encoder: Optional[Type[torch.nn.Module]] = None,
     ) -> None:
         super().__init__()
         self.target_table = target_table
         self.table_encoder_dict = torch.nn.ModuleDict(table_encoder_dict)
         self.lin_dict = torch.nn.ModuleDict()
-        for table_name, in_dim in table_dim.items():
-            self.lin_dict[table_name] = torch.nn.Linear(in_dim, graph_dim)
+        for table_name, in_dim in lin_input_dim_dict.items():
+            mlp = torch.nn.Sequential(
+                torch.nn.Linear(in_dim, graph_dim),
+                torch.nn.LayerNorm(graph_dim),
+                torch.nn.ReLU(),
+                torch.nn.Dropout(dropout),
+            )
+            self.lin_dict[table_name] = mlp
         self.graph_encoder = graph_encoder
+        self.dropout = dropout
 
+        # for llm enhence
+        if llm_vec_encoder is not None:
+            self.llm_vec_encoder = llm_vec_encoder
 
     def forward(
         self,
         table_dict: Dict[str, TableData],
         non_table_dict: Optional[Dict[str, Tensor]],
         edge_index: Tensor,
+        llm_vec: Optional[Tensor] = None,
     ) -> Tensor:
         target_l = len(table_dict[self.target_table])
         x_dict = {
@@ -188,20 +224,110 @@ class MultiTableBridge(torch.nn.Module):
                         [x_dict[table_name], embed], dim=1
                     )
 
+        # llm enhence embedding
+        if hasattr(self, "llm_vec_encoder") and llm_vec is not None:
+            llm_vec = self.llm_vec_encoder(llm_vec)
+            x_dict[self.target_table] = torch.concat([x_dict[self.target_table], llm_vec], dim=1)
+
         x_dict = {
             table_name: self.lin_dict[table_name](x)
             for table_name, x in x_dict.items()
         }
+
 
         x = torch.concat(
             [i for i in x_dict.values() if i is not None], dim=0
         )
 
         node_feats = self.graph_encoder(x, edge_index)
+        node_feats = F.dropout(node_feats, p=self.dropout, training=self.training)
         # target table always at first
         return node_feats[: target_l, :]
 
 
+class FuseII(torch.nn.Module):
+    def __init__(
+        self,
+        target_table: str,
+        lin_input_dim_dict: Dict[str, int],
+        graph_dim: int,
+        table_encoder_dict: Dict[str, TableEncoder],
+        graph_encoder: GraphEncoder,
+        *,
+        dropout: float = 0.5,
+        bridge_out_dim: int = 0,
+        llm_encoder_out_dim: int = 0,
+        hidden_dim: int = 0,
+        output_dim: int = 0,
+        llm_vec_encoder: Optional[Type[torch.nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        self.multi_table_bridge = MultiTableBridge(
+            target_table=target_table,
+            lin_input_dim_dict=lin_input_dim_dict,
+            graph_dim=graph_dim,
+            table_encoder_dict=table_encoder_dict,
+            graph_encoder=graph_encoder,
+            dropout=dropout,
+        )
+        self.llm_vec_encoder = llm_vec_encoder
+
+        self.lin_bridge = torch.nn.Linear(
+            in_features=bridge_out_dim,
+            out_features=hidden_dim,
+        )
+        self.lin_llm_embed = torch.nn.Linear(
+            in_features=llm_encoder_out_dim,
+            out_features=hidden_dim,
+        )
+        self.p = torch.nn.Parameter(torch.ones(1))
+        self.lin_out = torch.nn.Linear(
+            in_features=hidden_dim,
+            out_features=output_dim,
+        )
+
+        self.dropout = dropout
+
+    @property
+    def factor(self):
+        return torch.sigmoid(self.p)
+
+    def forward(
+        self,
+        table_dict: Dict[str, TableData],
+        non_table_dict: Optional[Dict[str, Tensor]],
+        edge_index: Tensor,
+        llm_vec: Tensor,
+    ):
+        bridge_out = self.multi_table_bridge(
+            table_dict=table_dict,
+            non_table_dict=non_table_dict,
+            edge_index=edge_index
+        )
+        x_1 = F.relu(self.lin_bridge(bridge_out))
+
+        llm_embed_out = self.llm_vec_encoder(llm_vec)
+        x_2 = F.relu(self.lin_llm_embed(llm_embed_out))
+
+        x = self.factor * x_1 + (1 - self.factor) * x_2 + x_2
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.lin_out(x)
+        return x
+
+        # x_1 = F.dropout(x_1, p=self.dropout, training=self.training)
+        # pred_1 = self.lin_out(x_1)
+
+        # x_2 = llm_vec[:, 0]
+        # x_2 = x_2.to(torch.int64)
+
+        # pred_2 = F.one_hot(x_2, num_classes=15)
+        # pred_2 = pred_2[:, :14].to(torch.float32)
+        # out = pred_2
+        # return out + self.factor * 0.001
+        # x = self.factor * x_1 + (1 - self.factor) * x_2
+
+
+###############################################################
 class HGraphEncoder(torch.nn.Module):
     def __init__(
         self,
@@ -274,39 +400,3 @@ class HGraphNN(torch.nn.Module):
         out = self.readout(x_dict[self.target_node_type])
         # out = F.dropout(out, p=self.dropout, training=self.training)
         return out
-
-
-class HBRIDGE(torch.nn.Module):
-
-    def __init__(
-        self,
-        table_encoder_dict: Dict[str, TableEncoder],
-        graph_encoder: HGraphEncoder,
-    ) -> None:
-        super().__init__()
-        self.table_encoder_dict = table_encoder_dict
-        self.graph_encoder = graph_encoder
-
-    def forward(
-        self,
-        table_dict: Dict[str, TableData],
-        hetero_graph: HeteroGraphData,
-        non_table_dict: Dict[str, Tensor] = None,
-    ) -> Tensor:
-        # Tables -- Table convs -- > table_out
-        table_out = {}
-        for table_name, table in table_dict.items():
-            table_out[table_name] = self.table_encoder_dict[table_name](table)
-
-        # Concat table_out with non_table_dict
-        if non_table_dict is not None:
-            for table_name, embed in non_table_dict.items():
-                table_out[table_name] = torch.concat(
-                    [table_out[table_name], embed], dim=1
-                )
-
-        graph_out = self.graph_encoder(table_out, hetero_graph)
-
-        out = torch.cat([*table_out.values(), graph_out], dim=1)
-        return out
-

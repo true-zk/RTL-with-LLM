@@ -69,11 +69,15 @@ def load_dataset(dataset_name, load_graph: bool = False):
             user_artists_table,
             user_friends_table,
         ) = dataset.data_list
-        return {
+        data_dict =  {
             "artists": artists_table,
             "user_artists": user_artists_table,
             "user_friends": user_friends_table,
         }
+        if load_graph:
+            g = _load_hgraph(dataset_name)
+            return data_dict, g
+        return data_dict
 
     elif dataset_name == "tml1m":
         dataset = TML1MDataset(cache_dir)
@@ -83,12 +87,16 @@ def load_dataset(dataset_name, load_graph: bool = False):
             ratings_table,
             movie_embeddings,
         ) = dataset.data_list
-        return {
+        data_dict =  {
             "users": users_table,
             "movies": movies_table,
             "ratings": ratings_table,
             "movie_embeddings": movie_embeddings,
         }
+        if load_graph:
+            g = _load_hgraph(dataset_name)
+            return data_dict, g
+        return data_dict
 
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")

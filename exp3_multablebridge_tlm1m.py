@@ -1,11 +1,11 @@
 # The BRIDGE method from the "rLLM: Relational Table Learning with LLMs" paper.
 # ArXiv: https://arxiv.org/abs/2407.20157
 
-# Datasets  TLF2K
-# Acc       0.471
+# Datasets  TML1M
+# Acc       0.397
 # MyAcc
 
-# TODO not done yet
+# TODO bug fix
 
 import time
 import argparse
@@ -35,57 +35,73 @@ args = parser.parse_args()
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-data, g = load_dataset(dataset_name='tlf2k', load_graph=True)
+data, g = load_dataset(dataset_name='tml1m', load_graph=True)
 
-target_table = data['artists'].to(device)
-y = data['artists'].y.long().to(device)
+target_table = data['users'].to(device)
+y = data['users'].y.long().to(device)
 
-edge_index1 = g['user', 'likes', 'artist'].edge_index
-edge_weight1 = g['user', 'likes', 'artist'].listening_cnt.to(torch.float)
-edge_index2 = g['user', 'friends_with', 'user'].edge_index
-rev_edge_index2 = edge_index2.flip(0)
+edge_index1 = g['user', 'rates', 'movie'].edge_index
+rev_edge_index1 = edge_index1.flip(0)
+adj = torch.concat(
+    [
+        edge_index1,
+        rev_edge_index1,
+    ],
+    dim=-1
+)
+
+num_nodes = len(data['users']) + len(data['movies'])
 
 adj = torch.sparse_coo_tensor(
     indices=adj,
     values=torch.ones(adj.size(1)),
-    size=(len(target_table), len(target_table)),
+    size=(num_nodes, num_nodes),
 ).to(device)
 g = GraphData(adj=adj)
 
 ####################################################################
-paper_emb_size = paper_embeddings.size(1)
+user_embed_size = 256
 table_transform = TabTransformerTransform(
-    out_dim=paper_emb_size, metadata=target_table.metadata
+    out_dim=user_embed_size, metadata=target_table.metadata
 )
 target_table = table_transform(data=target_table)
 
-author_emb_size = data['author_embeddings'].size(1)
-author_table_transform = TabTransformerTransform(
-    out_dim=author_emb_size, metadata=data['authors'].metadata
+movie_emb_size = data['movie_embeddings'].size(1)
+movie_table_transform = TabTransformerTransform(
+    out_dim=movie_emb_size, metadata=data['movies'].metadata
 )
-data['authors'] = author_table_transform(data=data['authors'])
+data['movies'] = movie_table_transform(data=data['movies'])
 
 graph_transform = GCNTransform()
 adj = graph_transform(data=g).adj
 adj = adj.to(device)
 
+# print(data['movies'].feat_dict)
+####################################################################
+from rllm.types import ColType
+# print(data['movies'].feat_dict[])
+# exit()
+data['movies'].feat_dict[ColType.NUMERICAL] = torch.ones(
+    (len(data['movies']), 64), device=device
+)
 ####################################################################
 table_dict = {
-    'paper': target_table.to(device),
-    'author': data['authors'].to(device),
+    'user': target_table.to(device),
+    'movie': data['movies'].to(device),
 }
-# non_table_dict = {
-#     'paper': paper_embeddings[len(target_table):, :],
-# }
+
 non_table_dict = {
-    'paper': paper_embeddings[:, :],
-    'author': data['author_embeddings'].to(device),
+    'user': torch.empty(0, device=device),
+    'movie': data['movie_embeddings'].to(device),
 }
 table_embed_dim_dict = {
-    'paper': paper_emb_size * 2,
-    'author': author_emb_size * 2,
+    'user': user_embed_size,
+    'movie': movie_emb_size + 64,
 }
-node_embed = paper_emb_size * 2
+node_embed = user_embed_size * 2
+
+# print(table_embed_dim_dict)
+# exit()
 ####################################################################
 
 # Split data
@@ -96,17 +112,17 @@ train_mask, val_mask, test_mask = (
 )
 
 # Set up model and optimizer
-t_encoder_paper = TableEncoder(
-    in_dim=paper_emb_size,
-    out_dim=paper_emb_size,
+t_encoder_user = TableEncoder(
+    in_dim=user_embed_size,
+    out_dim=user_embed_size,
     table_conv=TabTransformerConv,
     metadata=target_table.metadata,
 )
-t_encoder_author = TableEncoder(
-    in_dim=author_emb_size,
-    out_dim=author_emb_size,
+t_encoder_movie = TableEncoder(
+    in_dim=64,
+    out_dim=64,
     table_conv=TabTransformerConv,
-    metadata=data['authors'].metadata,
+    metadata=data['movies'].metadata,
 )
 g_encoder = GraphEncoder(
     in_dim=node_embed,
@@ -114,14 +130,15 @@ g_encoder = GraphEncoder(
     graph_conv=GCNConv,
 )
 model = MultiTableBridge(
-    target_table='paper',
+    target_table='user',
     lin_input_dim_dict=table_embed_dim_dict,
     graph_dim=node_embed,
     table_encoder_dict={
-        'paper': t_encoder_paper,
-        'author': t_encoder_author,
+        'user': t_encoder_user,
+        'movie': t_encoder_movie,
     },
     graph_encoder=g_encoder,
+    dropout=0.3
 ).to(device)
 optimizer = torch.optim.Adam(
     model.parameters(),
