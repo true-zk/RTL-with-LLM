@@ -2,6 +2,7 @@ from transformers import AutoTokenizer, AutoModel
 
 from config import (
     EMBEDDING_MODEL,
+    EMBEDDING_CACHE_DIR,
 )
 
 tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL)

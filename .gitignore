@@ -6,5 +6,6 @@
 /data
 /log
 /bridge
+/cache
 /myconfig.py
 draft.py

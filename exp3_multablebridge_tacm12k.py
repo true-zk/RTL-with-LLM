@@ -27,7 +27,7 @@ from rllm_loader import load_dataset
 torch.manual_seed(42)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
+parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
 parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate")
 parser.add_argument("--wd", type=float, default=5e-4, help="Weight decay")
 args = parser.parse_args()
@@ -160,7 +160,7 @@ def train() -> float:
 
 
 @torch.no_grad()
-def test():
+def test(return_preds=False):
     model.eval()
     logits = model(
         table_dict=table_dict,
@@ -173,19 +173,26 @@ def test():
     for mask in [train_mask, val_mask, test_mask]:
         correct = float(preds[mask].eq(y[mask]).sum().item())
         accs.append(correct / int(mask.sum()))
+
+    if return_preds:
+        return accs, preds
     return accs
+
+
+preds_10_times = []
 
 
 def main():
     start_time = time.time()
     best_val_acc = best_test_acc = 0
+    best_preds = None
     # val_acc_list = []
     # test_acc_list = []
     # train_acc_list = []
     # loss_list = []
     for epoch in range(1, args.epochs + 1):
         train_loss = train()
-        train_acc, val_acc, test_acc = test()
+        (train_acc, val_acc, test_acc), preds = test(return_preds=True)
         # loss_list.append(train_loss)
 
         # val_acc_list.append(val_acc)
@@ -199,7 +206,9 @@ def main():
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_test_acc = test_acc
+            best_preds = preds
 
+    preds_10_times.append(best_preds)
     print(f"Total Time: {time.time() - start_time:.4f}s")
     print(
         "MultiTableBRIDGE result: "
@@ -221,8 +230,12 @@ def main():
     return best_test_acc
 
 
-main()
+for i in range(10):
+    main()
 
+
+with open('./10_preds_mbridge.pt', 'wb') as f:
+    torch.save(preds_10_times, f)
 
 #################################################################
 

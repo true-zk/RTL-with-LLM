@@ -1,0 +1,83 @@
+Structured learning for non-smooth ranking losses,
+abstract is: Learning to rank from relevance judgment is an active research area.
+Itemwise score regression, pairwise preference satisfaction,
+and listwise structured learning are the major techniques in use.
+Listwise structured learning has been applied recently to optimize
+important non-decomposable ranking criteria like AUC (area under ROC curve)
+and MAP (mean average precision). We propose new, almost-linear-time algorithms
+to optimize for two other criteria widely used to evaluate search systems: MRR
+(mean reciprocal rank) and NDCG (normalized discounted cumulative gain) in the
+max-margin structured learning framework. We also demonstrate that, for different
+ranking criteria, one may need to use different feature maps.
+Search applications should not be optimized in favor of a single criterion,
+because they need to cater to a variety of queries.
+E.g., MRR is best for navigational queries, while NDCG is best for informational queries.
+A key contribution of this paper is to fold multiple ranking loss functions into a multi-criteria max-margin optimization.
+The result is a single,
+robust ranking model that is close to the best accuracy of learners trained on individual criteria.
+In fact, experiments over the popular LETOR and TREC data sets show that, contrary to conventional wisdom,
+a test criterion is often not best served by training with the same individual criterion.,
+
+
+
+Please enter your next message: review your answer, and reson, and give me the top reference you think the paper is from. and give me exact reasoning.
+The **top conference** for 『**Target** Paper node 0』 is **SIGIR**.
+
+### **Exact Reasoning:**
+1. **Core Topic Alignment**: The paper focuses on **ranking losses (MRR, NDCG) and search system optimization**,
+ which are central themes in **SIGIR** (Special Interest Group on Information Retrieval).
+2. **Datasets Mentioned**: The paper explicitly references **LETOR and TREC**,
+which are standard benchmarks in **information retrieval** (SIGIR’s primary domain).
+3. **Comparison to Other Conferences**:
+   - While **ICML** and **KDD** are plausible, they are broader and less specialized for ranking in search.
+   - **WWW** and **CIKM** are secondary fits because they include IR but are more web/data-centric.
+4. **Publication Trends**: Papers optimizing ranking metrics (e.g., MAP, NDCG) with structured learning are frequently published in **SIGIR**.
+
+### **Final Answer:**
+**SIGIR** is the most likely conference for this paper.
+
+
+
+Please enter your next message: use the graph structure information and check the relationship between the target paper and other papers and authors.
+give me more exact answer and reason.
+To provide a more precise answer, let’s analyze the **graph structure** and relationships between the target paper (node 0) and other nodes:
+
+### **Key Observations from the Graph:**
+1. **Citations (Edges: cited_by)**
+   - The target paper (node 0) cites **five other papers (nodes 1–5)**.
+   - These cited papers are primarily about:
+     - **Ranking and IR evaluation** (node 2: NDCG/MRR, node 3: MAP optimization, node 4: ranking loss, node 5: clickthrough data for ranking).
+     - **Support Vector Machines (SVMs)** (node 1: linear SVMs, node 3: SVM for MAP, node 5: SVM for ranking).
+   - This suggests the target paper is **IR-focused with strong ML (SVM/ranking) ties**.
+
+2. **Authors (Edges: writes)**
+   - The target paper is written by **four authors (nodes 0–3)**.
+   - **Soumen Chakrabarti (node 0)** is a well-known IR researcher (affiliated with IIT Bombay, IBM, etc.).
+   - The other authors (Khanna, Bhattacharyya, Sawant) are also associated with **IIT Bombay**, a hub for IR/ML research.
+
+3. **Cited Papers’ Venues (Indirect Evidence)**
+   - While the venues of cited papers aren’t provided, their topics align with:
+     - **SIGIR** (node 2: IR evaluation, node 5: clickthrough data).
+     - **ICML** (node 1: SVMs, node 3: SVM for MAP).
+     - **WWW/KDD** (node 5: search engines, node 4: ranking for web search).
+
+### **Most Likely Conferences:**
+Given the **IR + ML focus**, the **authors’ affiliations**, and the **cited works**, the top 5 likely venues are:
+1. **SIGIR** (primary venue for IR, ranking, and search).
+2. **WWW** (covers web search and ranking, aligns with node 5).
+3. **ICML** (machine learning focus, fits SVM/ranking optimization).
+4. **KDD** (applied ML/data mining, overlaps with IR).
+5. **CIKM** (broad IR/ML conference, but less specialized than SIGIR).
+
+### **Why Not Others?**
+- **VLDB/SIGMOD**: Database conferences, not a match for ranking/IR.
+- **STOC/SODA/SPAA/COLT**: Theoretical CS, irrelevant.
+- **SOSP/SIGCOMM/MobiCOMM**: Systems/networking, unrelated.
+
+### **Final Answer:**
+**[SIGIR, WWW, ICML, KDD, CIKM]**
+
+**Reason:**
+- The **target paper’s citations** heavily involve IR (SIGIR/WWW) and ML (ICML/KDD).
+- The **authors’ background** (IIT Bombay, IR/ML expertise) supports SIGIR/ICML.
+- The **ranking focus** (NDCG, MAP, SVMs) is core to SIGIR and ICML, with WWW/KDD as secondary fits.

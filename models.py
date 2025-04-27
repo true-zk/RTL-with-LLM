@@ -314,18 +314,67 @@ class FuseII(torch.nn.Module):
         x = self.lin_out(x)
         return x
 
-        # x_1 = F.dropout(x_1, p=self.dropout, training=self.training)
-        # pred_1 = self.lin_out(x_1)
 
-        # x_2 = llm_vec[:, 0]
-        # x_2 = x_2.to(torch.int64)
+###############################################################
+from rllm.nn.models import BRIDGE
 
-        # pred_2 = F.one_hot(x_2, num_classes=15)
-        # pred_2 = pred_2[:, :14].to(torch.float32)
-        # out = pred_2
-        # return out + self.factor * 0.001
-        # x = self.factor * x_1 + (1 - self.factor) * x_2
+class LLMBRIDGE(torch.nn.Module):
+    def __init__(
+        self,
+        bridge: BRIDGE,
+        bridge_out_dim: int = 0,
+        llm_encoder_out_dim: int = 0,
+        hidden_dim: int = 0,
+        output_dim: int = 0,
+        llm_vec_encoder: Optional[Type[torch.nn.Module]] = None,
+        dropout: float = 0.5,
+    ):
+        super().__init__()
+        self.bridge = bridge
+        self.llm_vec_encoder = llm_vec_encoder
 
+        self.lin_bridge = torch.nn.Linear(
+            in_features=bridge_out_dim,
+            out_features=hidden_dim,
+        )
+        self.lin_llm_embed = torch.nn.Linear(
+            in_features=llm_encoder_out_dim,
+            out_features=hidden_dim,
+        )
+        self.p = torch.nn.Parameter(torch.tensor([0.5]))
+        self.lin_out = torch.nn.Linear(
+            in_features=hidden_dim,
+            out_features=output_dim,
+        )
+
+        self.dropout = dropout
+
+    @property
+    def factor(self):
+        return torch.sigmoid(self.p)
+
+    def forward(
+        self,
+        table,
+        non_table,
+        adj,
+        llm_vec: Tensor,
+    ):
+        bridge_out = self.bridge(
+            table=table,
+            non_table=non_table,
+            adj=adj
+        )
+        x_1 = F.relu(self.lin_bridge(bridge_out))
+
+        llm_embed_out = self.llm_vec_encoder(llm_vec)
+        x_2 = F.relu(self.lin_llm_embed(llm_embed_out))
+
+        x = self.factor * x_1 + (1 - self.factor) * x_2 + x_2
+
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.lin_out(x)
+        return x
 
 ###############################################################
 class HGraphEncoder(torch.nn.Module):

@@ -8,6 +8,7 @@ MODEL_NAME = "deepseek-chat"
 
 # embedding model
 EMBEDDING_MODEL = os.path.join(root_, "bge-large-en-v1.5")
+EMBEDDING_CACHE_DIR = os.path.join(root_, "cache")
 
 # data paths
 RAW_DATA_ROOT_DIR = os.path.join(root_, "data")

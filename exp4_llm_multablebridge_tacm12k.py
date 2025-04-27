@@ -3,8 +3,8 @@
 
 # Datasets  TACM12K
 # Acc       0.293
-# Fuse1    ~0.82
-# Fuse2    ~0.95
+# Fuse1    ~0.616
+# Fuse2    ~0.645
 
 import time
 import argparse
@@ -24,7 +24,7 @@ from rllm.nn.models import TableEncoder, GraphEncoder
 
 from models import MultiTableBridge
 from rllm_loader import load_dataset
-from _utils import print_success
+from _utils import print_success, print_warning
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--epochs", type=int, default=150, help="Training epochs")
@@ -127,7 +127,7 @@ for idx in flip_indices:
 
 print("acc of simulation of llm pred:", (y == y_noise).float().mean())
 
-llm_enhance_vec = y.unsqueeze(-1).repeat_interleave(5, dim=1)
+llm_enhance_vec = y_noise.unsqueeze(-1).repeat_interleave(5, dim=1)
 llm_enhance_vec[:, 1:] = torch.randint(0, 13, (len(y), 4))
 
 llm_vec_size = llm_enhance_vec.size(1)  # 5
@@ -328,6 +328,8 @@ for model_name, (model, optim) in model_optim_dict.items():
     best_val_acc, best_test_acc = train_one_model(model_name, model.to(device), optim)
     res_d[model_name]['val'] = best_val_acc
     res_d[model_name]['test'] = best_test_acc
+    if model_name == "FuseII":
+        print_warning(str(model.p))
 
 
 print_success("all done")
