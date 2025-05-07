@@ -7,5 +7,6 @@
 /log
 /bridge
 /cache
-/myconfig.py
+config.py
+/legacy
 draft.py
